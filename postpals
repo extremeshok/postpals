@@ -1,0 +1,577 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Storable qw(nstore retrieve);
+use Time::HiRes qw(tv_interval gettimeofday);
+use Digest::MD5 qw(md5);
+use IO::Multiplex;
+use POSIX qw(setlocale LC_ALL);
+
+my $NAME = 'postpals';
+my $VERSION = '0.01';
+
+setlocale(LC_ALL, 'C');
+umask(077);
+
+my %opts;	# global options
+my %attr;	# holds per $fh policy attributes for mux_input
+my $now = time;	# no need for accurate time(), update $now in mux_timeout
+my $db = {};	# the whitelist database
+
+##
+## Help
+##
+
+sub usage {
+    return 'Usage: '.$0.' [options] <socket>
+
+  -f             do not daemonize, stay in foreground
+  -v             verbose, even more logging
+  -q             quiet, very little logging
+  -p <pidfile>   save daemon pid in this file
+  -u <user>      user to run as
+  -g <group>     group to run as
+  -h, --help     display this help and exit
+
+  -m <time>      cleanup and save database every x time
+                   (default: 1h)
+  -d <file>      save database to this file (using perl Storable)
+                   (default: no file)
+  -a <ip,...>    allowed IP addresses to connect (comma separated)
+                   (default: any)
+
+  -T <test,...>  tests to perform (comma separated)
+                   relay    (exact relay match)
+                   relay24  (relay C-class match)
+                   rcpt     (recipient/sender pair)
+                   (default: relay,relay24,rcpt)
+  -C             use these restriction classes instead of OK on match
+                   postpals_hit_relay
+                   postpals_hit_relay24
+                   postpals_hit_rcpt
+  -P <time>      purge entries from database if not seen in x time
+                   (default: 4w)
+
+  <socket>       socket to listen to
+                   unix: /tmp/postpals.sock (full path)
+                   tcp: [host:]port (default host: localhost)
+
+Time option requires s,m,h,d,w (sec,min,hour,day,week).
+Daemonizing requires Net::Server::Daemonize module.
+
+';
+}
+
+##
+## Helpers
+##
+
+sub _timetosec {
+    return undef unless $_[0] =~ /^(\d+)([smhdw])$/;
+    if ($2 eq 's') { return $1; }
+    elsif ($2 eq 'm') { return $1 * 60; }
+    elsif ($2 eq 'h') { return $1 * 60 * 60; }
+    elsif ($2 eq 'd') { return $1 * 60 * 60 * 24; }
+    elsif ($2 eq 'w') { return $1 * 60 * 60 * 24 * 7; }
+}
+                           
+sub _log {
+    my ($msg, $prio) = @_;
+
+    # replace all non-printable
+    $msg =~ s/[^[:ascii:][:graph:] ]/?/gs;
+
+    if ($opts{foreground}) {
+        print STDERR $msg."\n";
+    } else {
+        # Sys::Syslog < 0.15 workaround
+        if ($opts{old_syslog}) {
+            eval {
+                local $SIG{__DIE__} = sub { };
+                Sys::Syslog::syslog(defined $prio ? $prio : 'info', '%s', $msg);
+            };
+        } else {
+            Sys::Syslog::syslog(defined $prio ? $prio : 'info', '%s', $msg);
+        }
+    }
+}
+
+sub _digest {
+    # return 5 bytes (40 bits) of md5, surely
+    # one in a million collision is acceptable here
+    return substr(md5($_[0]), -5);
+}
+
+sub _add_entry {
+    my ($relay, $recipient, $sender) = @_;
+
+    # no IPv6 support yet
+    $relay =~ /^(\d+\.\d+\.\d+)\.\d+$/ or $relay = '';
+    my $relay24 = defined $1 ? $1.'.0' : '';
+
+    # save memory
+    my $n_now = pack('N', $now);
+
+    if ($opts{tests}{relay} && $relay ne '') {
+        # exact relay
+        my $relay_packed = inet_aton($relay);
+        $db->{relay}{$relay_packed} = $n_now;
+    }
+    if ($opts{tests}{relay24} && $relay24 ne '') {
+        # relay/24
+        my $relay_packed = inet_aton($relay24);
+        $db->{relay24}{$relay_packed} = $n_now;
+    }
+    if ($opts{tests}{rcpt} &&
+            $sender ne '' && $recipient ne '' &&
+            $sender ne $recipient) { # ignore spoofs?
+        # sender/recipient pair
+        $db->{rcpt}{_digest(lc("$sender $recipient"))} = $n_now;
+    }
+}
+
+sub _del_entry {
+    my ($relay, $recipient, $sender) = @_;
+
+    # no IPv6 support yet
+    $relay =~ /^(\d+\.\d+\.\d+)\.\d+$/ or $relay = '';
+    my $relay24 = defined $1 ? $1.'.0' : '';
+
+    if ($relay ne '') {
+        # exact relay
+        my $relay_packed = inet_aton($relay);
+        delete $db->{relay}{$relay_packed};
+    }
+    if ($relay24 ne '') {
+        # relay/24
+        my $relay_packed = inet_aton($relay24);
+        delete $db->{relay24}{$relay_packed};
+    }
+    if ($sender ne '' && $recipient ne '') {
+        # sender/recipient pair
+        delete $db->{rcpt}{_digest(lc("$sender $recipient"))};
+    }
+}
+
+sub _check_policy {
+    my ($sender, $recipient, $relay, $rname) = @_;
+
+    # no IPv6 support yet
+    $relay =~ /^(\d+\.\d+\.\d+)\.\d+$/ or $relay = '';
+    my $relay24 = defined $1 ? $1.'.0' : '';
+
+    if ($opts{tests}{relay} && $relay ne '') {
+        # exact relay
+        my $relay_packed = inet_aton($relay);
+        if (defined $db->{relay}{$relay_packed}) {
+            _log("Known relay: $rname\[$relay\] (last out ".
+                 int(($now - unpack('N', $db->{relay}{$relay_packed})) / 3600).
+                 "h ago)") unless $opts{quiet};
+            return $opts{classreply} ? 'postpals_hit_relay' : 'OK';
+        }
+    }
+    if ($opts{tests}{relay24} && $relay24 ne '') {
+        # relay/24
+        my $relay_packed = inet_aton($relay24);
+        if (defined $db->{relay24}{$relay_packed}) {
+            _log("Known relay/24: $rname\[$relay\] (last out ".
+                 int(($now - unpack('N', $db->{relay24}{$relay_packed})) / 3600).
+                 "h ago)") unless $opts{quiet};
+            return $opts{classreply} ? 'postpals_hit_relay24' : 'OK';
+        }
+    }
+    if ($opts{tests}{rcpt} &&
+            $sender ne '' && $recipient ne '' &&
+            $sender ne $recipient) { # ignore spoofs?
+        # sender/recipient pair
+        my $pair = _digest(lc("$recipient $sender"));
+        if (defined $db->{rcpt}{$pair}) {
+            _log("Known sender: $sender for $recipient (last out ".
+                 int(($now - unpack('N', $db->{rcpt}{$pair})) / 3600).
+                 "h ago)") unless $opts{quiet};
+            return $opts{classreply} ? 'postpals_hit_rcpt' : 'OK';
+        }
+    }
+
+    return 'DUNNO';
+}
+
+sub _store_db {
+    my $start = [gettimeofday];
+    my $status = eval { nstore($db, $opts{storefile}.'.tmp'); };
+    my $total = sprintf('%.2f', tv_interval($start, [gettimeofday]));
+    if (defined $status && rename($opts{storefile}.'.tmp', $opts{storefile})) {
+        _log('Database saved to '.$opts{storefile}." (took $total sec)")
+            unless $opts{quiet};
+    } else {
+        _log('Error saving database to '.$opts{storefile}.": $@", 'warning');
+    }
+}
+
+##
+## The Mux Loop
+##
+
+sub mux_input {
+    my ($self, $mux, $fh, $data) = @_;
+
+    while ($$data =~ s/^([^\012]*)\012//) {
+        next unless defined $1;
+        my $line = $1;
+        $line =~ s/\015$//;
+        my ($a, $b) = split('=', $line, 2);
+        if (defined $b) {
+            $attr{$fh}{$a} = $b;
+        } elsif ($line eq '') {
+            if (!defined $attr{$fh}{request}) {
+                _log('Invalid request') if $opts{verbose};
+                close($fh); last;
+            } elsif ($attr{$fh}{request} eq 'smtpd_access_policy') {
+                my $action = _check_policy(
+                    $attr{$fh}{sender}         || '',
+                    $attr{$fh}{recipient}      || '',
+                    $attr{$fh}{client_address} || '',
+                    $attr{$fh}{client_name}    || '',
+                    );
+                print $fh "action=$action\012\012";
+            } elsif ($attr{$fh}{request} eq 'postpals_add_entry') {
+                _add_entry(
+                    $attr{$fh}{relay}     || '',
+                    $attr{$fh}{recipient} || '',
+                    $attr{$fh}{sender}    || '',
+                    );
+            } elsif ($attr{$fh}{request} eq 'postpals_del_entry') {
+                _del_entry(
+                    $attr{$fh}{relay}     || '',
+                    $attr{$fh}{recipient} || '',
+                    $attr{$fh}{sender}    || '',
+                    );
+            } else {
+                _log('Invalid request type: '.$attr{$fh}{request}) if $opts{verbose};
+                close($fh); last;
+            }
+            # clear attrs
+            $attr{$fh} = ();
+        } else {
+            _log('Ignoring garbage: '.substr($line, 0, 100)) if $opts{verbose};
+            close($fh); last;
+        }
+    }
+}
+
+sub mux_connection {
+    my ($self, $mux, $fh) = @_;
+
+    if (defined $opts{allowed_ips}) {
+        unless (defined $opts{allowed_ips}{$fh->peerhost}) {
+            _log('Unauthorized connection blocked: '.$fh->peerhost, 'warning');
+            $mux->shutdown($fh, 1);
+            $mux->close($fh);
+            return;
+        }
+    }
+
+    # clear attrs
+    $attr{$fh} = ();
+}
+
+sub mux_eof {
+    my ($self, $mux, $fh) = @_;
+
+    # finish socket
+    $mux->shutdown($fh, 1);
+}
+
+sub mux_close {
+    my ($self, $mux, $fh) = @_;
+
+    # delete attrs
+    delete $attr{$fh};
+    # remove socket
+    $mux->close($fh);
+}
+
+# check some things once a minute
+sub mux_timeout {
+    my ($self, $mux, $fh) = @_;
+
+    $now = time; # update time
+
+    # maintenance, remove old keys and save database
+    if ($now - $opts{last_maintenance} >= $opts{maintenance}) {
+        my $older_than = $now - $opts{purge};
+        my ($key, $seen);
+        my $start = [gettimeofday];
+        # clean relays
+        my $k1 = scalar keys %{$db->{relay}};
+        while (($key, $seen) = each(%{$db->{relay}})) {
+            delete $db->{relay}{$key} if unpack('N', $seen) < $older_than;
+        }
+        # clean relay24s
+        my $k2 = scalar keys %{$db->{relay24}};
+        while (($key, $seen) = each(%{$db->{relay24}})) {
+            delete $db->{relay24}{$key} if unpack('N', $seen) < $older_than;
+        }
+        # clean sender/recipient pairs
+        my $k3 = scalar keys %{$db->{rcpt}};
+        while (($key, $seen) = each(%{$db->{rcpt}})) {
+            delete $db->{rcpt}{$key} if unpack('N', $seen) < $older_than;
+        }
+        #
+        my $total = sprintf('%.2f', tv_interval($start, [gettimeofday]));
+        my $kk1 = scalar keys %{$db->{relay}};
+        my $kk2 = scalar keys %{$db->{relay24}};
+        my $kk3 = scalar keys %{$db->{rcpt}};
+        _log("Database cleanup (".
+             $k1.($kk1 != $k1 ? '->'.$kk1 : '').' relay, '.
+             $k2.($kk2 != $k2 ? '->'.$kk2 : '').' relay24, '.
+             $k3.($kk3 != $k3 ? '->'.$kk3 : '').' rcpt, '.
+             "took $total sec)") unless $opts{quiet};
+        # save database
+        _store_db() if $opts{storefile};
+        $opts{last_maintenance} = $now;
+    }
+
+    $mux->set_timeout($fh, 60); # reset timer
+}
+
+##
+## Parse options
+##
+
+while (@ARGV && $ARGV[0] =~ /^(-[fvqpughmdaTCP-]|--help)$/) {
+    my ($opt, $val);
+    $opt = shift @ARGV;
+    last if $opt eq '-';
+    unless ($opt =~ /^(?:-[fvqhC]|--help)$/) {
+        $val = shift @ARGV;
+        defined $val or die "ERROR: Missing value for $opt\n\n".usage();
+    }
+
+    if ($opt eq '-f') {
+        $opts{foreground} = 1;
+    } elsif ($opt eq '-v') {
+        $opts{verbose} = 1;
+    } elsif ($opt eq '-q') {
+        $opts{quiet} = 1;
+    } elsif ($opt eq '-p') {
+        $val =~ /^\/.+/
+            or die "ERROR: Need full path to file for $opt\n\n".usage();
+        $opts{pidfile} = $val;
+    } elsif ($opt eq '-u') {
+        $< == 0  or die "ERROR: Must run as root to use $opt\n\n";
+        $opts{user} = $val;
+    } elsif ($opt eq '-g') {
+        $< == 0  or die "ERROR: Must run as root to use $opt\n\n";
+        $opts{group} = $val;
+    } elsif ($opt eq '-h' || $opt eq '--help') {
+        print usage();
+        exit;
+    }
+
+    elsif ($opt eq '-m') {
+        $opts{maintenance} = _timetosec($val)
+            or die "ERROR: Invalid value for $opt\n\n".usage();
+    } elsif ($opt eq '-d') {
+        $val =~ /^\/.+/ or die "ERROR: Need full path to file for $opt\n\n".usage();
+        $opts{storefile} = $val;
+    } elsif ($opt eq '-a') {
+        foreach my $ip (split(',', $val)) {
+            $ip =~ /^\d+\.\d+\.\d+\.\d+$/
+                or die "ERROR: Invalid value for $opt\n\n".usage();
+            $opts{allowed_ips}{$ip} = 1;
+        }
+    }
+
+    elsif ($opt eq '-T') {
+        foreach my $test (split(',', lc($val))) {
+            if ($test =~ /^(?:relay|relay24|rcpt)$/) {
+                $opts{tests}{$test} = 1;
+            } else {
+                die "ERROR: Invalid value for $opt\n\n".usage();
+            }
+        }
+    } elsif ($opt eq '-C') {
+        $opts{classreply} = 1;
+    } elsif ($opt eq '-P') {
+        $opts{purge} = _timetosec($val)
+            or die "ERROR: Invalid value for $opt\n\n".usage();
+    }
+
+    else {
+        die "ERROR: Unknown option $opt\n\n".usage();
+    }
+}
+if (@ARGV) {
+    my $socket = shift @ARGV;
+    $socket =~ /^(?:(\/).+|(?:([\w.-]+):)?(\d+))$/
+        or die "ERROR: Invalid socket value: $socket\n\n".usage();
+    if (defined $1) {
+        $opts{socktype} = 'unix';
+        $opts{sockpath} = $socket;
+    } elsif (defined $3) {
+        $opts{socktype} = 'inet';
+        $opts{sockhost} = $2 if defined $2;
+        $opts{sockport} = $3;
+    } else {
+        die "ERROR: Invalid socket value: $socket\n\n".usage();
+    }
+} else {
+    die "ERROR: Socket required\n\n".usage();
+}
+die "ERROR: Invalid parameters\n\n".usage() if @ARGV;
+
+## Default options
+
+$opts{foreground}  ||= 0;
+$opts{verbose}	   ||= 0;
+$opts{quiet}	   ||= 0;
+$opts{pidfile}	   ||= undef;
+$opts{user}	   ||= $>;
+$opts{group}	   ||= $);
+
+$opts{maintenance} ||= _timetosec('1h');
+$opts{storefile}   ||= undef;
+$opts{sockhost}	   ||= 'localhost';
+
+if (defined $opts{tests}) {
+    $opts{tests}{relay}   ||= 0;
+    $opts{tests}{relay24} ||= 0;
+    $opts{tests}{rcpt}    ||= 0;
+} else {
+    $opts{tests}{relay}   = 1;
+    $opts{tests}{relay24} = 1;
+    $opts{tests}{rcpt}    = 1;
+}
+$opts{purge}	  ||= _timetosec('4w');
+$opts{classreply} ||= 0;
+
+# internal
+$opts{old_syslog} = 0;
+$opts{last_maintenance} = $now;
+
+##
+## Main
+##
+
+# start socket
+my $sock;
+if ($opts{socktype} eq 'inet') {
+    use IO::Socket::INET;
+    $sock = IO::Socket::INET->new(
+        Proto => 'tcp',
+        LocalAddr => $opts{sockhost},
+        LocalPort => $opts{sockport},
+        Listen => SOMAXCONN,
+        Timeout => 5,
+        ReuseAddr => 1,
+        );
+} else {
+    if (-e $opts{sockpath}) {
+        unlink($opts{sockpath})
+            or die "ERROR: Failed to remove old socketfile: $@\n";
+    }
+    use IO::Socket::UNIX;
+    $sock = IO::Socket::UNIX->new(
+        Local => $opts{sockpath},
+        Listen => SOMAXCONN,
+        );
+}
+die "ERROR: Socket bind failure: $@\n" unless $sock;
+
+# daemonize
+unless ($opts{foreground}) {
+    eval { require Net::Server::Daemonize; };
+    die $@ if $@;
+    eval { require Sys::Syslog; };
+    die $@ if $@;
+    Net::Server::Daemonize::daemonize($opts{user}, $opts{group}, $opts{pidfile});
+    # default logsock is 'native' on >= 0.15
+    $opts{old_syslog} = 1 unless defined $Sys::Syslog::VERSION && $Sys::Syslog::VERSION >= 0.15;
+    Sys::Syslog::setlogsock($^O eq 'Solaris' ? 'inet' : 'unix') if $opts{old_syslog};
+    my $logopts = 'ndelay,pid';
+    $logopts .= ',nofatal' unless $opts{old_syslog}; # nofatal support on 0.15
+    Sys::Syslog::openlog($NAME, $logopts, 'mail');
+    # direct errors to syslog
+    $SIG{__WARN__} = sub { Sys::Syslog::syslog('warning', '%s', "WARNING: $_[0]"); };
+    $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', '%s', "FATAL: $_[0]"); exit; };
+    # done
+    _log("$NAME v$VERSION started daemonized: uid $>, gid $)");
+}
+
+# load db
+if ($opts{storefile} && -f $opts{storefile}) {
+    my $start = [gettimeofday];
+    eval { $db = retrieve($opts{storefile}); };
+    if ($@) {
+        _log('Error loading database from '.$opts{storefile}.": $@", 'warning');
+        exit;
+    } else {
+        my $total = sprintf('%.2f', tv_interval($start, [gettimeofday]));
+        my $k1 = scalar keys %{$db->{relay}};
+        my $k2 = scalar keys %{$db->{relay24}};
+        my $k3 = scalar keys %{$db->{rcpt}};
+        _log("Database loaded from $opts{storefile} ($k1 relay, $k2 relay24, $k3 rcpt, took $total sec)");
+    }
+}
+
+# save db on exit
+$SIG{TERM} = sub { _store_db(); _log('Exiting..'); exit; };
+$SIG{INT} = $SIG{TERM};
+
+# start mux loop
+my $mux = IO::Multiplex->new;
+$mux->listen($sock);
+$mux->set_callback_object(__PACKAGE__);
+$mux->set_timeout($sock, 60);
+$mux->loop;
+
+1;
+
+__END__
+
+=head1 NAME
+
+Postpals - Postfix policy daemon
+
+See: http://mailfud.org/postpals/
+
+=head1 LICENSE
+
+Postpals is free software and released under BSD license, which basically
+means that you can do what you want as long as you keep the copyright
+notice:
+
+Copyright (c) 2010, Henrik Krohns <postpals@hege.li>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+ * Neither the name of the copyright holders nor the names of its
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+=head1 AUTHOR
+
+Henrik Krohns <postpals@hege.li>
+
+=cut
