@@ -1,0 +1,352 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use POSIX qw(setlocale LC_ALL);
+
+my $NAME = 'postpals-taillog';
+my $VERSION = '0.02';
+
+setlocale(LC_ALL, 'C');
+
+my %opts;	# global options
+my %ids;	# holds postfix queue ids for parsing
+my $sock;	# socket for connecting to policy daemon
+
+##
+## Help
+##
+
+sub usage {
+    return 'Usage: '.$0.' [options] <socket> [logfile]
+
+  -f             do not daemonize, stay in foreground
+  -v             verbose logging
+  -p <pidfile>   save daemon pid in this file
+  -u <user>      user to run as
+  -g <group>     group to run as
+  -h, --help     display this help and exit
+
+  -x             exit on connection failure
+  -l <ip,...>    IPs of local relays (comma separated)
+                   mail destined to these is not considered outgoing
+                   (127. is always listed)
+  -n <name>      postfix syslog_name setting (default: postfix)
+                   will parse this instance name from logfile
+
+  <socket>       socket of postpals policy daemon (REQUIRED)
+                   unix: /tmp/postpals.sock
+                   tcp: [host:]port (localhost unless host)
+
+If logfile is \'-\' or not given, will read from STDIN.
+Direct logfile reading requires File::Tail module.
+Daemonizing requires Net::Server::Daemonize module.
+
+';
+}
+
+##
+## Helpers
+##
+
+sub _log {
+    my ($msg, $prio) = @_;
+
+    # replace all non-printable
+    $msg =~ s/[^[:ascii:][:graph:] ]/?/gs;
+
+    if ($opts{foreground}) {
+        print STDERR $msg."\n";
+    }
+    else {
+        # Sys::Syslog < 0.15 workaround
+        if ($opts{old_syslog}) {
+            eval {
+                local $SIG{__DIE__} = sub { };
+                Sys::Syslog::syslog(defined $prio ? $prio : 'info', '%s', $msg);
+            };
+        }
+        else {
+            Sys::Syslog::syslog(defined $prio ? $prio : 'info', '%s', $msg);
+        }
+    }
+}
+
+sub _connect {
+    if ($opts{socktype} eq 'inet') {
+        $sock = IO::Socket::INET->new(
+            PeerAddr => $opts{sockhost},
+            PeerPort => $opts{sockport},
+            Proto => 'tcp',
+            Timeout => 5,
+            );
+    }
+    else {
+        $sock = IO::Socket::UNIX->new(
+            Peer => $opts{sockpath},
+            );
+    }
+    unless ($sock) {
+        _log('Policy connect failed: '.$@, 'warning');
+        exit if $opts{sockfatal};
+    }
+    return $sock;
+}
+
+# Automatically (re)connect and send data
+# Min. 5 seconds reconnect delay
+sub _send {
+    _log("Outgoing: $_[0] $_[1] $_[2]") if $opts{verbose};
+    unless ($sock) {
+        my $now = time;
+        return if $now - $opts{lastconn} < 5;
+        $opts{lastconn} = $now;
+        return unless _connect();
+    }
+    if (!$sock->send("request=postpals_add_entry\n".
+                     "sender=$_[0]\nrecipient=$_[1]\nrelay=$_[2]\n\n")) {
+        _log('Policy connect failed: '.(defined $@ ? $@ : $!), 'warning');
+        exit if $opts{sockfatal};
+        undef $sock;
+    }
+}
+
+##
+## Parse options
+##
+
+while (@ARGV && $ARGV[0] =~ /^(-[fvpughxln-]|--help)$/) {
+    my ($opt, $val);
+    $opt = shift @ARGV;
+    last if $opt eq '-';
+    unless ($opt =~ /^(?:-[fvhx]|--help)$/) {
+        $val = shift @ARGV;
+        defined $val or die "ERROR: Missing value for $opt\n\n".usage();
+    }
+
+    if ($opt eq '-f') {
+        $opts{foreground} = 1;
+    } elsif ($opt eq '-v') {
+        $opts{verbose} = 1;
+    } elsif ($opt eq '-p') {
+        $val =~ /^\/.+/
+            or die "ERROR: Need full path to file for $opt\n\n".usage();
+        $opts{pidfile} = $val;
+    } elsif ($opt eq '-u') {
+        $< == 0  or die "ERROR: Must run as root to use $opt\n\n";
+        $opts{user} = $val;
+    } elsif ($opt eq '-g') {
+        $< == 0  or die "ERROR: Must run as root to use $opt\n\n";
+        $opts{group} = $val;
+    } elsif ($opt eq '-h' || $opt eq '--help') {
+        print usage();
+        exit;
+    }
+
+    elsif ($opt eq '-x') {
+        $opts{sockfatal} = 1;
+    } elsif ($opt eq '-l') {
+        my @ips = ('127\.');
+        foreach my $ip (split(',', $val)) {
+            $ip =~ /^[\d.]+$/i
+                or die "ERROR: Invalid value for $opt: $ip\n\n".usage();
+            $ip =~ /^(\d+\.){1,2}\d+$/ and $val .= '.';
+            $ip =~ s/\./\\./g;
+            push(@ips, $ip);
+        }
+        $opts{skiprelay} = join('|', @ips);
+    } elsif ($opt eq '-n') {
+        $val =~ /^[\w-]+$/i
+            or die "ERROR: Invalid value for $opt: $val\n\n".usage();
+        $opts{name} = $val;
+    }
+
+    else {
+        die "ERROR: Unknown option $opt\n\n".usage();
+    }
+}
+if (@ARGV) {
+    my $socket = shift @ARGV;
+    $socket =~ /^(?:(\/).+|(?:([\w.-]+):)?(\d+))$/
+        or die "ERROR: Invalid socket value: $socket\n\n".usage();
+    if (defined $1) {
+        -w $socket or print STDERR "Notice: Socket not writable, will keep trying: $socket\n";
+        $opts{socktype} = 'unix';
+        $opts{sockpath} = $socket;
+    } elsif (defined $3) {
+        $opts{socktype} = 'inet';
+        $opts{sockhost} = $2 if defined $2;
+        $opts{sockport} = $3;
+    } else {
+        die "ERROR: Invalid socket value: $socket\n\n".usage();
+    }
+} else {
+    die "ERROR: Socket required\n\n".usage();
+}
+if (@ARGV) {
+    my $logfile = shift @ARGV;
+    if ($logfile ne '-' && ! -r $logfile) {
+        print STDERR "Notice: Logfile not readable, will keep trying: $logfile\n";
+    }
+    $opts{logfile} = $logfile;
+}
+die "ERROR: Invalid parameters\n\n".usage() if @ARGV;
+
+## Default options
+
+$opts{foreground} ||= 0;
+$opts{verbose}	  ||= 0;
+$opts{pidfile}	  ||= undef;
+$opts{user}	  ||= $>;
+$opts{group}	  ||= $);
+
+$opts{sockhost}	  ||= 'localhost';
+
+$opts{sockfatal}  ||= 0;
+$opts{skiprelay}  ||= '127\.';
+$opts{name}	  ||= 'postfix';
+
+$opts{logfile}	  ||= '-';
+
+# internal
+$opts{old_syslog} = 0;
+$opts{lastconn} = 0;
+
+##
+## Main
+##
+
+# Socket module
+if ($opts{socktype} eq 'inet') {
+    use IO::Socket::INET;
+} else {
+    use IO::Socket::UNIX;
+}
+
+# Log handling
+my $log_re = qr%
+    ^[^\[]+?			# stop parse quick if instance not found
+    [ ] $opts{name}/(?:smtp|qmgr) \[ [^ ]+ # postfix instance
+    (?: [ ] \[ [^\]]* \] )?	# [ID \d+ mail.info] ?
+    [ ] ([a-zA-Z0-9]+):		# queue id
+    [ ] (?:
+      (r)emoved |
+      from=<([^>]+\@[^>]+)> |
+      to=<([^>]+\@[^>]+)>, [ ] relay= [^\[,]+ \[ ((?!$opts{skiprelay})[\d.]+) \] [^\(]+ status=sent
+    )
+%x;
+
+sub _parse_logline {
+    return unless $_[0] =~ $log_re;
+    if (defined $2) { # removed
+        delete $ids{$1};
+    } elsif (defined $3) { # from
+        $ids{$1} = lc($3);
+    } else { # to
+        # from, to , relay
+        _send($ids{$1}, lc($4), $5) if defined $ids{$1};
+    }
+}
+
+# Don't die on closed connections
+$SIG{PIPE} = 'IGNORE';
+
+# pretty exit
+$SIG{TERM} = sub { _log('Exiting..'); exit; };
+
+## STDIN ...
+
+if ($opts{logfile} eq '-') {
+    $opts{foreground} = 1; # no syslog
+    _parse_logline($_) while (<STDIN>);
+    exit;
+}
+
+## ... OR TAIL
+
+eval { require File::Tail; };
+die $@ if $@;
+
+unless ($opts{foreground}) {
+    eval { require Net::Server::Daemonize; };
+    die $@ if $@;
+    eval { require Sys::Syslog; };
+    die $@ if $@;
+    # daemonize
+    Net::Server::Daemonize::daemonize($opts{user}, $opts{group}, $opts{pidfile});
+    # default logsock is 'native' on >= 0.15
+    $opts{old_syslog} = 1 unless defined $Sys::Syslog::VERSION && $Sys::Syslog::VERSION >= 0.15;
+    Sys::Syslog::setlogsock($^O eq 'Solaris' ? 'inet' : 'unix') if $opts{old_syslog};
+    my $logopts = 'ndelay,pid';
+    $logopts .= ',nofatal' unless $opts{old_syslog}; # nofatal support on 0.15
+    Sys::Syslog::openlog($NAME, $logopts, 'mail');
+    # direct errors to syslog
+    $SIG{__WARN__} = sub { Sys::Syslog::syslog('warning', '%s', "WARNING: $_[0]"); };
+    $SIG{__DIE__}  = sub { Sys::Syslog::syslog('crit', '%s', "FATAL: $_[0]"); exit; };
+    # done
+    _log("$NAME v$VERSION started daemonized: uid $>, gid $)");
+}
+
+while (1) {
+    my $logfile = File::Tail->new(
+        name => $opts{logfile},
+        maxinterval => 3,
+        interval => 3,
+        resetafter => 30,
+        maxbuf => 524288,
+        ignore_nonexistant => 1,
+        );
+    my $line;
+    _parse_logline($line) while (defined($line = $logfile->read));
+    _log('Restarting File::Tail? This should not happen?', 'warning');
+    sleep(5);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Postpals-taillog - Postpals postfix policy daemon helper
+
+See: http://mailfud.org/postpals/
+
+=head1 LICENSE
+
+Postpals is free software and released under BSD license, which basically
+means that you can do what you want as long as you keep the copyright
+notice:
+
+Copyright (c) 2010, Henrik Krohns <postpals@hege.li>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+ * Neither the name of the copyright holders nor the names of its
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+=head1 AUTHOR
+
+Henrik Krohns <postpals@hege.li>
+
+=cut
