@@ -1,0 +1,107 @@
+#!/bin/bash
+#
+# Generic Init.d service script by Adrian Jon Kriel (c) admin@extremeshok.com
+#
+# chkconfig: 2345 20 20
+# short-description: postpals-taillog
+# description: Startup script for postpals-taillog Daemon Server by Adrian Jon Kriel (c) admin@extremeshok.com
+
+### BEGIN INIT INFO
+# Provides:          postpals-taillog
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+
+NAME="postpals-taillog"
+DAEMON="/usr/local/sbin/postpals-taillog"
+RETVAL=0
+LOG_FILE="/var/log/postpals.log"
+
+# Source function library.
+if [ -f /etc/rc.d/init.d/functions ] ; then
+	. /etc/rc.d/init.d/functions
+elif [ -f /lib/lsb/init-functions ] ; then
+	. /lib/lsb/init-functions
+fi
+
+# Exit if the package is not installed
+[ -x "$DAEMON" ] || exit 0
+
+# Read configuration variable file if it is present
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+
+start()
+{
+  echo -n "Starting $NAME: "
+  if [ -e "$PIDFILE" ] && [ -e /proc/`head -n 1 "$PIDFILE"` ]; then
+    echo "already running.";
+    return 0
+  fi
+
+  $DAEMON -p "$PIDFILE" $OPTIONS $SOCKET $TAILLOGFILE >> $LOG_FILE 2>&1 &
+  RETVAL=$?
+  #if you need to save the pid as the daemon might not have an option to specify a file to save the pid
+  #echo $! > $PIDFILE
+  if [ $RETVAL == 0 ]; then
+    echo "done."
+  else
+    echo "failed. See error code for more information."
+  fi
+  return $RETVAL
+}
+
+stop()
+{
+  echo -n "Force Shutting down $NAME: "
+  if [ -e "$PIDFILE" ]; then
+    kill -9 ` head -n 1 "$PIDFILE"`
+    RETVAL=$?
+  fi
+  if [ $RETVAL != 0 ]; then
+    pkill -f $NAME > /dev/null
+    RETVAL=$?
+  fi
+  if [ $RETVAL == 0 ]; then
+    echo "done."
+    rm -f $pidfile
+  else
+    echo "failed. See error code for more information."
+  fi
+  return $RETVAL
+}
+
+##NOT USED, purely for reference or if there are future bugs with status $progs
+mystatus()
+{
+  if [ -e "$PIDFILE" ] && [ -e /proc/$(head -n 1 "$PIDFILE") ]; then
+    echo "$NAME is already running.";
+    return 0
+  else
+    echo  "$NAME NOT running.";
+    return 0
+  fi
+}
+
+case "$1" in
+start)
+  start
+  ;;
+stop)
+  stop
+  ;;
+restart)
+  stop
+  start
+  ;;
+status)
+  mystatus
+  #status $DAEMON
+  ;;
+*)
+  echo $"Usage: $NAME {start|stop|restart|status}" >&2
+  RETVAL=3
+esac
+exit $RETVAL

@@ -17,9 +17,16 @@ Postpals is written in Perl for easy maintenance and has only few non-standard m
 
 Postpals-taillog is a daemon used to continuously tail postfix mail log and to send found sender/recipient/relay entries to the main postpals daemon database. That way the main daemon is more robust and not limited in which way to receive information.
 
-## Installation
-
-No help for now. Just download the scripts to /usr/local/sbin or such. Then you need to create startup scripts and users as necessary, it depends on your system. Have a look at options the scripts provide and examples below.
+## Installation on Debian / Ubuntu
+apt-get install -y libio-multiplex-perl libnet-server-perl libfile-tail-perl
+mkdir /var/postpals
+Download the code, save postpals and postpals-taillog to /usr/local/sbin/
+chmod 755 /usr/local/sbin/postpals-taillog
+chmod 755 /usr/local/sbin/postpals
+Save the contents of /etc to /etc
+Edit the /etc/default/postpals and /etc/default/postpals-taillog to set your options
+Run postpals with service postpals start
+Run postpals-taillog with service postpals start
 
 ## Basic example
 

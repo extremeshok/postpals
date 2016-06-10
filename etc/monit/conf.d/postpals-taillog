@@ -1,0 +1,6 @@
+## eXtremeSHOK.com
+check process postpals-taillog with pidfile /var/run/postpals-taillog.pid
+  start program = "/etc/init.d/postpals-taillog start" with timeout 60 seconds
+  stop program = "/etc/init.d/postpals-taillog stop"
+  if 5 restarts within 5 cycles then alert
+## eXtremeSHOK.com

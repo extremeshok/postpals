@@ -1,0 +1,30 @@
+# /etc/default/postpals
+## eXtremeSHOK.com
+
+# If you're using systemd (default for jessie), the ENABLED setting is
+# not used. Instead, enable spamd by issuing:
+# systemctl enable spamassassin.service
+# Change to "1" to enable spamd on systems using sysvinit:
+ENABLED=1
+
+# Options
+# See postpals --help for possible options. The -p option is automatically added.
+#
+#  -P <time>      purge entries from database if not seen in x time (default: 4w)
+#  -m <time>      cleanup and save database every x time (default: 1h)
+#  -T <test,...>  tests to perform (comma separated)
+#                   relay    (exact relay match)
+#                   relay24  (relay C-class match)
+#                   rcpt     (recipient/sender pair)
+#                  (default: relay,relay24,rcpt)
+#
+OPTIONS="-m 1h -P 6w -d /var/postpals/postpals.db -T relay,relay24,rcpt"
+
+# Pid file
+# Where should spamd write its PID to file? If you use the -u or
+# --username option above, this needs to be writable by that user.
+# Otherwise, the init script will not be able to shut spamd down.
+PIDFILE="/var/run/postpals.pid"
+
+#Socket/Port
+SOCKET=10040

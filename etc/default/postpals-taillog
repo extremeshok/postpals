@@ -1,0 +1,31 @@
+# /etc/default/postpals-taillog
+## eXtremeSHOK.com
+
+# If you're using systemd (default for jessie), the ENABLED setting is
+# not used. Instead, enable spamd by issuing:
+# systemctl enable spamassassin.service
+# Change to "1" to enable spamd on systems using sysvinit:
+ENABLED=1
+
+# Options
+# See postpals-taillog --help for possible options. The -p option is automatically added.
+#
+#  -x             exit on connection failure
+#  -l <ip,...>    IPs of local relays (comma separated mail destined to these is not considered outgoing
+#                (127. is always listed)
+
+#
+OPTIONS="-x -v"
+
+# Pid file
+# Where should spamd write its PID to file? If you use the -u or
+# --username option above, this needs to be writable by that user.
+# Otherwise, the init script will not be able to shut spamd down.
+PIDFILE="/var/run/postpals-taillog.pid"
+
+# Log File to Tail
+# Location of the mail.log to read/monitor
+TAILLOGFILE="/var/log/mail.log"
+
+#Socket/Port
+SOCKET=10040
