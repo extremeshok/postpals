@@ -1,0 +1,8 @@
+## eXtremeSHOK.com
+check process postpals with pidfile /var/run/postpals.pid
+  start program = "/etc/init.d/postpals start" with timeout 60 seconds
+  stop program = "/etc/init.d/postpals stop"
+  #if failed port 10040 protocol smtp with timeout 60 seconds then restart
+  #if failed port 10040 type tcp with timeout 60 seconds then restart
+  if 5 restarts within 5 cycles then alert
+## eXtremeSHOK.com
