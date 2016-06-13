@@ -1,0 +1,18 @@
+###################
+# This is property of eXtremeSHOK.com
+# You are free to use, modify and distribute, however you may not remove this notice.
+# Copyright (c) Adrian Jon Kriel :: admin@extremeshok.com
+##################
+# PLACE THIS FILE IN: /etc/mail/spamassassin
+
+header POSTPALS_RELAY24 X-Postpals-Hit =~ /\brelay24\b/
+score POSTPALS_RELAY24 -0.5
+describe POSTPALS_RELAY24 Postpals Network(24) Match
+
+header POSTPALS_RELAY X-Postpals-Hit =~ /\brelay\b/
+score POSTPALS_RELAY -1
+describe POSTPALS_RELAY Postpals Relay(IP) Match
+
+header POSTPALS_RCPT X-Postpals-Hit =~ /\brcpt\b/
+score POSTPALS_RCPT -1.5
+describe POSTPALS_RCPT Postpals Recipient Match

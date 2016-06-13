@@ -18,7 +18,7 @@ ENABLED=1
 #                   rcpt     (recipient/sender pair)
 #                  (default: relay,relay24,rcpt)
 #
-OPTIONS="-m 1h -P 6w -d /var/postpals/postpals.db -T relay,relay24,rcpt"
+OPTIONS="-m 1h -P 6w -d /var/postpals/postpals.db -T relay,relay24,rcpt -C"
 
 # Pid file
 # Where should spamd write its PID to file? If you use the -u or

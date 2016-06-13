@@ -1,0 +1,25 @@
+###################
+# This is property of eXtremeSHOK.com
+# You are free to use, modify and distribute, however you may not remove this notice.
+# Copyright (c) Adrian Jon Kriel :: admin@extremeshok.com
+##################
+# ADD THE CONTENTS OF THIS FILE IN: /etc/postfix/main.cf
+
+# Modify the smtpd_restriction_classes like this...
+
+smtpd_restriction_classes =
+  postpals_hit_relay
+  postpals_hit_relay24
+  postpals_hit_rcpt
+
+postpals_hit_relay =
+  check_sender_access pcre:/etc/postfix/postpals_hit_relay.pcre
+  permit_auth_destination
+
+postpals_hit_relay24 =
+  check_sender_access pcre:/etc/postfix/postpals_hit_relay24.pcre
+  permit_auth_destination
+
+postpals_hit_rcpt =
+  check_sender_access pcre:/etc/postfix/postpals_hit_rcpt.pcre
+  permit_auth_destination
